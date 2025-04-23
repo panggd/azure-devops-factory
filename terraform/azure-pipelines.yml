@@ -1,0 +1,214 @@
+# azure-pipelines.yml
+trigger: none  # Disable automatic triggers for security compliance
+
+resources:
+  repositories:
+    - repository: tfvars
+      type: Git
+      name: <YOUR_AZURE_DEVOPS_PROJECT>/azure-devops-factory-tfvars # This is the monorepo that house application devops tfvars
+      ref: main
+      trigger:
+        branches:
+          include:
+            - application/*/dev # branch can be application/<appteamname>/dev/terraform.tfvars
+            - application/*/stg
+            - application/*/prd
+        paths:
+          include:
+            - 'terraform.tfvars'
+          exclude:
+            - README.md  # Exclude documentation updates
+            - '**/*.md'  # Exclude all Markdown files
+
+variables:
+  - name: resourceGroup
+    value: 'rg_devops_factory'
+  - name: location
+    value: 'southeastasia'
+  - name: spName
+    value: 'sp_devops_factory'
+  - name: kvName
+    value: 'kv-devops-factory'
+  - name: secretName
+    value: 'devops-sp-secret'
+  - name: devopsOrgName
+    value: 'devops-factory-org-dev'
+  - name: devopsPipelineAgentName
+    value: 'devbox-pool'
+  - name: devopsServiceConnection
+    value: 'devops-factory-svc-conn'
+  - name: storageAccountName
+    value: 'stdevopsfactoryorg'
+  - name: containerName
+    value: $[format('ct{0}', replace(replace(replace(variables['Build.SourceBranch'], 'refs/heads/application/', ''), '-', ''), '/', ''))]
+  - name: tfvarsFile
+    value: $(Build.SourcesDirectory)/devops-factory-tfvars/terraform.tfvars
+
+stages:
+  - stage: BranchValidation
+    displayName: 'Branch Validation Checks'
+    jobs:
+    - job: BranchPatternAudit
+      displayName: 'Branch Pattern Audit'
+      pool:
+        name: $(devopsPipelineAgentName) # self hosted agents
+        # vmImage: 'ubuntu-latest' # microsoft hosted agents
+      steps:
+      - script: |
+          echo "Validating branch pattern compliance... $(Build.SourceBranch)"
+          [[ "$(Build.SourceBranch)" =~ ^(refs/heads/application/[^/]+/(dev|stg|prd))$ ]] || exit 1
+        displayName: 'Branch Pattern Check'
+
+  - stage: InfrastructureSetup
+    displayName: 'Infrastructure Pre-Check'
+    dependsOn: BranchValidation
+    condition: succeeded()
+    jobs:
+    - job: AzureResources
+      displayName: 'Check Essential Resources Exist'
+      pool:
+        name: $(devopsPipelineAgentName) # self hosted agents
+        # vmImage: 'ubuntu-latest' # microsoft hosted agents
+      steps:
+      - task: AzureCLI@2
+        displayName: 'Resource Group, Storage Account & Key Vault'
+        inputs:
+          azureSubscription: $(devopsServiceConnection)
+          scriptType: 'bash'
+          scriptLocation: 'inlineScript'
+          inlineScript: |
+            if ! az group show -n $(resourceGroup) --output none 2>/dev/null; then
+              echo "Storage account: $(resourceGroup) does not exist. Please run init.sh first."
+              exit 1
+            else
+              echo "Resource group: $(resourceGroup) exists."
+            fi
+
+            # If storage account not exist, create
+            if ! az storage account show --name $(storageAccountName) --resource-group $(resourceGroup) --output none 2>/dev/null; then
+              echo "Storage account: $(storageAccountName) does not exist. Please run init.sh first."
+              exit 1
+            else
+              echo "Storage account: $(storageAccountName) exists."
+            fi
+
+            # If storage account container not exist, create
+            if ! az storage container show \
+              --account-name $(storageAccountName) \
+              --name $(containerName) \
+              --auth-mode login \
+               --output none 2>/dev/null; then
+              echo "Storage account $(storageAccountName) container $(containerName) not found. Creating..."
+              az storage container create \
+                --account-name $(storageAccountName) \
+                --name $(containerName) \
+                --auth-mode login \
+                --fail-on-exist || exit 1
+            else
+              echo "Storage account $(storageAccountName) container $(containerName) exists."
+            fi
+
+            # If keyvault not exist, create
+            if ! az keyvault show -n $(kvName) -g $(resourceGroup) --output none 2>/dev/null; then
+              echo "Key vault: $(kvName) does not exist. Please run init.sh first."
+              exit 1
+            else
+              echo "Key vault: $(kvName) exists."
+            fi
+
+            # If keyvault not exist, create
+            if ! az keyvault show -n $(kvName) -g $(resourceGroup) --output none 2>/dev/null; then
+              echo "Key vault: $(kvName) does not exist. Please run init.sh first."
+              exit 1
+            else
+              echo "Key vault: $(kvName) exists."
+            fi
+
+  - stage: ServicePrincipalSetup
+    displayName: 'Prepare Terraform Env Variables'
+    dependsOn: InfrastructureSetup
+    condition: succeeded()
+    jobs:
+    - job: SPManagement
+      displayName: 'Extract Service Principal Credentials'
+      pool:
+        name: $(devopsPipelineAgentName) # self hosted agents
+        # vmImage: 'ubuntu-latest' # microsoft hosted agents
+      steps:
+      - task: AzureCLI@2
+        displayName: 'Save Service Principal Credentials as TF ENV Vars '
+        inputs:
+          azureSubscription: $(devopsServiceConnection)
+          scriptType: 'bash'
+          scriptLocation: 'inlineScript'
+          inlineScript: |
+            TENANT_ID=$(az account show --query tenantId -o tsv)
+            SUBSCRIPTION_ID=$(az account show --query id --output tsv)
+            SP_APP_ID=$(az ad sp list --display-name $(spName) --query [0].appId -o tsv)
+
+            echo "##vso[task.setvariable variable=ARM_TENANT_ID;issecret=true]$TENANT_ID"
+            echo "##vso[task.setvariable variable=ARM_SUBSCRIPTION_ID;issecret=true]$SUBSCRIPTION_ID"
+
+            if [ -z "$SP_APP_ID" ]; then
+              echo "Service Principal: $(spName) does not exist. Please run init.sh first."
+              exit 1
+            else
+              echo "##vso[task.setvariable variable=ARM_CLIENT_ID;issecret=true]$SP_APP_ID"
+              echo "##vso[task.setvariable variable=ARM_CLIENT_SECRET;issecret=true]$(az keyvault secret show --vault-name $(kvName) --name $(secretName) --query value -o tsv)"
+            fi
+
+  - stage: TerraformOperations
+    displayName: 'Terraform Execution'
+    dependsOn: ServicePrincipalSetup
+    condition: succeeded()
+    jobs:
+    - job: TerraformInitPlanApply
+      displayName: 'Infrastructure as Code'
+      pool:
+        name: $(devopsPipelineAgentName) # self hosted agents
+        # vmImage: 'ubuntu-latest' # microsoft hosted agents
+      steps:
+      - checkout: self
+      - checkout: tfvars
+
+      - task: TerraformInstaller@1
+        displayName: install terraform
+        inputs:
+          terraformVersion: 1.11.3
+
+      - task: TerraformTaskV4@4
+        displayName: 'Terraform Init'
+        env:
+          ARM_TENANT_ID: $(ARM_TENANT_ID)
+          ARM_SUBSCRIPTION_ID: $(ARM_SUBSCRIPTION_ID)
+          ARM_CLIENT_ID: $(ARM_CLIENT_ID)
+          ARM_CLIENT_SECRET: $(ARM_CLIENT_SECRET)
+        inputs:
+          provider: 'azurerm'
+          command: init
+          backendServiceArm: $(devopsServiceConnection)
+          backendAzureRmResourceGroupName: $(resourceGroup)
+          backendAzureRmStorageAccountName: $(storageAccountName)
+          backendAzureRmContainerName: $(containerName)
+          backendAzureRmKey: terraform.tfstate
+
+      - task: TerraformTaskV4@4
+        displayName: 'Terraform Plan'
+        env:
+          ARM_TENANT_ID: $(ARM_TENANT_ID)
+          ARM_SUBSCRIPTION_ID: $(ARM_SUBSCRIPTION_ID)
+          ARM_CLIENT_ID: $(ARM_CLIENT_ID)
+          ARM_CLIENT_SECRET: $(ARM_CLIENT_SECRET)
+        inputs:
+          provider: 'azurerm'
+          command: plan
+          commandOptions: -var-file=$(tfvarsFile)
+          environmentServiceNameAzureRM: $(devopsServiceConnection)
+
+  #     - task: TerraformCLI@0
+  #       displayName: 'Terraform Apply'
+  #       inputs:
+  #         provider: 'azurerm'
+  #         command: apply
+  #         commandOptions: -auto-approve
+  #         environmentServiceNameAzureRM: $(devopsServiceConnection)

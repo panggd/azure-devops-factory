@@ -1,0 +1,31 @@
+parameters:
+  azureSubscription: ''
+  appName: ''
+  environmentName: ''
+  artifactName: ''
+  zipFileName: ''
+
+jobs:
+- deployment: DeployWebApp
+  displayName: "Deploy to Azure Web App"
+  environment: ${{ parameters.environmentName }}
+  pool:
+    name: $(devopsPipelineAgentName)
+  strategy:
+    runOnce:
+      deploy:
+        steps:
+        - task: DownloadBuildArtifacts@1
+          displayName: "Download Artifacts"
+          inputs:
+            buildType: 'current'
+            downloadType: 'single'
+            artifactName: '${{ parameters.artifactName }}'
+            downloadPath: '$(System.ArtifactsDirectory)'
+
+        - task: AzureWebApp@1
+          displayName: "Deploy to Azure Web App"
+          inputs:
+            azureSubscription: '${{ parameters.azureSubscription }}'
+            appName: '${{ parameters.appName }}'
+            package: '$(System.ArtifactsDirectory)/${{ parameters.artifactName }}/${{ parameters.zipFileName }}'

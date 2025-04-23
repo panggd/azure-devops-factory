@@ -1,0 +1,125 @@
+trigger:
+- dev
+
+variables:
+  pythonVersion: '3.11'
+  environmentName: 'development'
+  projectRoot: $(System.DefaultWorkingDirectory)
+
+stages:
+
+- stage: Setup
+  displayName: "Setup Environment"
+  jobs:
+  - job: SetupJob
+    displayName: "Setup Python Environment"
+    pool:
+      name: $(devopsPipelineAgentName)
+    steps:
+    - template: .azure-pipelines/install-python.yml
+      parameters:
+        pythonVersion: '$(pythonVersion)'
+        installExtras: true
+
+- stage: Test
+  displayName: "Test and Security Scan Stage"
+  dependsOn: Setup
+  jobs:
+  - job: TestJob
+    displayName: "Run Tests and Security Scans"
+    pool:
+      name: $(devopsPipelineAgentName)
+    steps:
+    - template: .azure-pipelines/install-python.yml
+      parameters:
+        pythonVersion: '$(pythonVersion)'
+        installExtras: true
+
+    - task: SonarQubePrepare@7
+      displayName: "Prepare SonarQube Analysis"
+      inputs:
+        SonarQube: $(sonarQubeEndpoint)
+        scannerMode: 'CLI'
+        configMode: 'manual'
+        cliProjectKey: '$(sonarProjectKey)'
+        cliSources: '.'
+        extraProperties: |
+          sonar.python.coverage.reportPaths=coverage.xml
+          sonar.python.xunit.reportPath=junit/test-results.xml
+
+    - script: |
+        mkdir -p junit
+        flake8 .
+        pytest --junitxml=junit/test-results.xml --cov=. --cov-report=xml
+      displayName: "Run Tests and Code Coverage"
+
+    - task: SonarQubeAnalyze@7
+      displayName: "Run SonarQube Analysis"
+
+    - task: SonarQubePublish@7
+      displayName: "Publish SonarQube Results"
+      inputs:
+        pollingTimeoutSec: '300'
+
+    - task: PublishTestResults@2
+      condition: succeededOrFailed()
+      inputs:
+        testResultsFormat: 'JUnit'
+        testResultsFiles: '**/test-*.xml'
+        mergeTestResults: true
+        testRunTitle: 'Python Tests'
+
+- stage: Build
+  displayName: "Build Stage"
+  dependsOn: Test
+  condition: succeeded()
+  jobs:
+  - job: BuildJob
+    displayName: "Build Job"
+    pool:
+      name: $(devopsPipelineAgentName)
+    steps:
+    - template: .azure-pipelines/install-python.yml
+      parameters:
+        pythonVersion: '$(pythonVersion)'
+        installExtras: false
+
+    - task: ArchiveFiles@2
+      displayName: "Archive Files"
+      inputs:
+        rootFolderOrFile: $(System.DefaultWorkingDirectory)
+        includeRootFolder: false
+        archiveType: zip
+        archiveFile: $(Build.ArtifactStagingDirectory)/$(webAppName)-$(Build.BuildId).zip
+        replaceExistingArchive: true
+
+    - task: PublishBuildArtifacts@1
+      inputs:
+        PathtoPublish: '$(Build.ArtifactStagingDirectory)/$(webAppName)-$(Build.BuildId).zip'
+        ArtifactName: $(webAppName)
+        publishLocation: 'Container'
+
+- stage: Deploy
+  displayName: "Deploy to Development"
+  dependsOn: Build
+  condition: succeeded()
+  jobs:
+  - template: templates/deploy-webapp.yml
+    parameters:
+      azureSubscription: $(svcConnAzurerm)
+      appName: $(webAppName)
+      environmentName: $(environment)
+      artifactName: $(webAppName)
+      zipFileName: '$(webAppName)-$(Build.BuildId).zip'
+
+- stage: PromoteToStaging
+  displayName: "Promote to Staging"
+  dependsOn: Deploy
+  condition: succeeded()
+  jobs:
+  - template: templates/promote-branch.yml
+    parameters:
+      sourceBranch: 'dev'
+      targetBranch: 'staging'
+      gitUserEmail: 'pipeline@example.com'
+      gitUserName: 'Azure Pipeline'

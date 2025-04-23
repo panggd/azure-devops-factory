@@ -1,0 +1,23 @@
+parameters:
+  sourceBranch: ''
+  targetBranch: ''
+  gitUserEmail: ''
+  gitUserName: ''
+
+jobs:
+- job: PromoteBranch
+  displayName: "Promote ${{ parameters.sourceBranch }} to ${{ parameters.targetBranch }}"
+  pool:
+    name: $(devopsPipelineAgentName)
+  steps:
+    - checkout: self
+      persistCredentials: true
+
+    - script: |
+        git config user.email "${{ parameters.gitUserEmail }}"
+        git config user.name "${{ parameters.gitUserName }}"
+        git fetch origin
+        git checkout -b ${{ parameters.targetBranch }} origin/${{ parameters.targetBranch }} || git checkout ${{ parameters.targetBranch }}
+        git merge origin/${{ parameters.sourceBranch }} -m "Promote ${{ parameters.sourceBranch }} to ${{ parameters.targetBranch }} via Azure Pipeline"
+        git push origin ${{ parameters.targetBranch }}
+      displayName: "Merge ${{ parameters.sourceBranch }} into ${{ parameters.targetBranch }}"

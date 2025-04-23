@@ -1,0 +1,70 @@
+trigger:
+- main
+
+variables:
+  environmentName: 'production'
+  projectRoot: $(System.DefaultWorkingDirectory)
+  zipFileName: '$(webAppName)-staging.zip'
+  stagingArtifactName: '$(webAppName)'
+
+stages:
+
+- stage: PromoteArtifact
+  displayName: "Promote Staging Artifact"
+  jobs:
+  - job: FetchArtifact
+    displayName: "Download Latest Staging Artifact"
+    pool:
+      name: $(devopsPipelineAgentName)
+    steps:
+    - task: DownloadPipelineArtifact@2
+      inputs:
+        buildType: 'specific'
+        project: '$(System.TeamProject)'
+        pipeline: $(stgPipelineId)
+        runVersion: 'latestFromBranch'
+        branchName: 'refs/heads/main'
+        artifact: '$(stagingArtifactName)'
+        path: '$(Pipeline.Workspace)/prod-artifact'
+
+    - script: |
+        echo "Listing downloaded artifact contents..."
+        ls -la $(Pipeline.Workspace)/prod-artifact
+      displayName: "Verify Downloaded Artifact"
+
+- stage: CABApproval
+  displayName: "CAB Approval"
+  dependsOn: PromoteArtifact
+  condition: succeeded()
+  jobs:
+  - job: WaitForApproval
+    displayName: "Manual CAB Approval"
+    pool:
+      name: $(devopsPipelineAgentName)
+    steps:
+    - task: ManualValidation@0
+      timeoutInMinutes: 20160  # 2 weeks
+      inputs:
+        instructions: 'Please attach CAB approval evidence and approve deployment.'
+        onTimeout: 'reject'
+
+- stage: DeployToProduction
+  displayName: "Deploy to Production"
+  dependsOn: CABApproval
+  condition: succeeded()
+  jobs:
+  - deployment: DeployProd
+    displayName: "Deploy Production Artifact"
+    environment: $(environmentName)
+    pool:
+      name: $(devopsPipelineAgentName)
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: AzureWebApp@1
+            displayName: "Deploy to Azure Web App"
+            inputs:
+              azureSubscription: $($(svcConnAzurerm))
+              appName: '$(webAppName)'
+              package: '$(Pipeline.Workspace)/prod-artifact/$(zipFileName)'

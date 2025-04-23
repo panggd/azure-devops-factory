@@ -1,0 +1,186 @@
+trigger:
+- stg
+
+variables:
+  loadTestUrl: '/'
+  pythonVersion: '3.11'
+  environmentName: 'staging'
+  projectRoot: $(System.DefaultWorkingDirectory)
+  zipFileName: '$(webAppName)-$(Build.BuildId).zip'
+
+stages:
+
+- stage: Setup
+  displayName: "Setup Python Environment"
+  jobs:
+  - job: SetupJob
+    displayName: "Setup"
+    pool:
+      name: $(devopsPipelineAgentName)
+    steps:
+    - template: .azure-pipelines/install-python.yml
+      parameters:
+        pythonVersion: '$(pythonVersion)'
+        installExtras: false
+
+- stage: Build
+  displayName: "Build Stage"
+  dependsOn: Setup
+  condition: succeeded()
+  jobs:
+  - job: BuildJob
+    displayName: "Build"
+    pool:
+      name: $(devopsPipelineAgentName)
+    steps:
+    - template: .azure-pipelines/install-python.yml
+      parameters:
+        pythonVersion: '$(pythonVersion)'
+        installExtras: false
+
+    - task: ArchiveFiles@2
+      displayName: "Archive Files"
+      inputs:
+        rootFolderOrFile: $(System.DefaultWorkingDirectory)
+        includeRootFolder: false
+        archiveType: zip
+        archiveFile: $(Build.ArtifactStagingDirectory)/$(zipFileName)
+        replaceExistingArchive: true
+
+    - task: PublishBuildArtifacts@1
+      inputs:
+        PathtoPublish: '$(Build.ArtifactStagingDirectory)/$(zipFileName)'
+        ArtifactName: $(webAppName)
+        publishLocation: 'Container'
+
+- stage: IntegrationTest
+  displayName: "Run Integration Tests"
+  dependsOn: Build
+  condition: succeeded()
+  jobs:
+  - job: RunIntegrationTests
+    displayName: "Integration Test Job"
+    pool:
+      name: $(devopsPipelineAgentName)
+    steps:
+    - checkout: self
+    - task: UsePythonVersion@0
+      inputs:
+        versionSpec: '$(pythonVersion)'
+    - script: |
+        pip install -r requirements.txt
+        pip install pytest
+        pytest tests/integration/ --junitxml=integration-test-results.xml
+      displayName: "Run Pytest Integration Tests"
+
+    - task: PublishTestResults@2
+      condition: succeededOrFailed()
+      inputs:
+        testResultsFormat: 'JUnit'
+        testResultsFiles: 'integration-test-results.xml'
+        mergeTestResults: true
+        testRunTitle: 'Integration Tests'
+
+- stage: Deploy
+  displayName: "Deploy to Staging"
+  dependsOn: IntegrationTest
+  condition: succeeded()
+  jobs:
+  - template: templates/deploy-webapp.yml
+    parameters:
+      azureSubscription: $(svcConnAzurerm)
+      appName: $(webAppName)
+      environmentName: $(environmentName)
+      artifactName: $(webAppName)
+      zipFileName: '$(zipFileName)'
+      slotName: 'staging'
+      enableSlotSwap: false
+
+- stage: DAST
+  displayName: "Run DAST Full Scan"
+  dependsOn: Deploy
+  condition: succeeded()
+  jobs:
+  - job: DASTScan
+    displayName: "DAST Scan with ZAP"
+    pool:
+      name: $(devopsPipelineAgentName)
+    steps:
+    - script: |
+        echo "Pulling OWASP ZAP Docker image..."
+        docker pull owasp/zap2docker-stable
+
+        echo "Running ZAP Full Scan..."
+        docker run --rm -v $(System.DefaultWorkingDirectory):/zap/wrk:rw \
+          owasp/zap2docker-stable zap-full-scan.py \
+          -t https://$(webAppName)-staging.azurewebsites.net \
+          -g gen.conf -r zap-full-report.html -J zap-full-report.json
+      displayName: "Run OWASP ZAP Full Scan"
+
+    - task: PublishPipelineArtifact@1
+      inputs:
+        targetPath: '$(System.DefaultWorkingDirectory)/zap-full-report.html'
+        artifact: 'zap-html-report'
+        publishLocation: 'pipeline'
+
+    - task: PublishPipelineArtifact@1
+      inputs:
+        targetPath: '$(System.DefaultWorkingDirectory)/zap-full-report.json'
+        artifact: 'zap-json-report'
+        publishLocation: 'pipeline'
+
+- stage: LoadTest
+  displayName: "Run Load Test"
+  dependsOn: DAST
+  condition: succeeded()
+  jobs:
+  - job: LoadTestJob
+    pool:
+      name: $(devopsPipelineAgentName)
+    steps:
+    - checkout: self
+    - task: UsePythonVersion@0
+      inputs:
+        versionSpec: '$(pythonVersion)'
+    - script: |
+        pip install locust
+
+        echo "from locust import task, constant, FastHttpUser" > locustfile.py
+        echo "class GenericUser(FastHttpUser):" >> locustfile.py
+        echo "    wait_time = constant(1)" >> locustfile.py
+        echo "\n    @task\n    def test_target(self):\n        self.client.get('$(loadTestUrl)')" >> locustfile.py
+
+        locust --headless --host=https://$(webAppName)-staging.azurewebsites.net \
+               --users 50 --spawn-rate 5 --run-time 2m --html locust-report.html || exit 1
+      displayName: "Execute Locust Load Test"
+
+    - task: PublishPipelineArtifact@1
+      inputs:
+        targetPath: 'locust-report.html'
+        artifact: 'locust-report'
+        publishLocation: 'pipeline'
+
+- stage: HealthCheck
+  displayName: "Health Check"
+  dependsOn: LoadTest
+  condition: succeeded()
+  jobs:
+  - job: CheckAppHealth
+    pool:
+      name: $(devopsPipelineAgentName)
+    steps:
+    - script: |
+        curl -f https://$(webAppName)-staging.azurewebsites.net/health || exit 1
+      displayName: "Check App Health Endpoint"
+
+- stage: PromoteToMain
+  displayName: "Promote Staging to Main Branch"
+  dependsOn: HealthCheck
+  condition: succeeded()
+  jobs:
+  - template: templates/promote-branch.yml
+    parameters:
+      sourceBranch: 'stg'
+      targetBranch: 'main'
+      gitUserEmail: 'pipeline@example.com'
+      gitUserName: 'Azure Pipeline'
